@@ -1,0 +1,224 @@
+########################Calculate measure of phylogenetic signal (heritability) - Colony size and Queen mating frequency######################
+###Calculate over 400 trees using MCMCglmm
+##Run MCMCglmm models in parallel
+#Louis Bell-Roberts
+#21/02/2024
+
+
+
+#Load packages
+library(tidyverse)
+library(ape)
+library(phytools)
+library(ggplot2)
+library(geiger)
+library(doParallel)
+library(MCMCglmm)
+library(coda)
+
+#Use 40 cores for parallel computation
+registerDoParallel(40)
+
+#Read in data file
+ant_data <- read.csv("ant_data.csv")
+
+#Set variables so that they're in the correct structure and apply transformations
+class(ant_data$colony.size) 
+class(ant_data$queen.mating.frequency)
+ant_data$colony.size <- log10(ant_data$colony.size)
+ant_data$queen.mating.frequency <- log10(ant_data$queen.mating.frequency)
+
+#Rename 'species' column as 'animal'
+ant_data <- ant_data %>% dplyr::rename(animal = species)
+
+#Read in sample of 400 phylogenetic trees
+ant_trees <- read.tree(file ="Economo_2018_400.tre")
+
+
+###################### 
+#Signal in colony size
+###################### 
+
+########################################## 
+
+
+#Filter data
+sxData_CS <- ant_data %>% dplyr::filter(complete.cases(colony.size), complete.cases(caste.number)) %>% dplyr::select(animal, colony.size)
+
+#Prune tree
+ant_trees_pruned_CS <- drop.tip.multiPhylo(ant_trees, setdiff(ant_trees[[1]]$tip.label, sxData_CS$animal))
+
+#Prune database
+sxData_CS <- dplyr::filter(sxData_CS, animal %in% ant_trees_pruned_CS[[1]]$tip.label)
+
+#Check that species names in the tree and the data match
+sxData_CS$animal[which((sxData_CS$animal %in% ant_trees_pruned_CS[[1]]$tip.label) == FALSE)]	# 0 means all match
+ant_trees_pruned_CS[[1]]$tip.label[which((ant_trees_pruned_CS[[1]]$tip.label %in% sxData_CS$animal) == FALSE)]	# 0 means all match
+
+#########
+#MCMCglmm models
+#########
+
+##Set prior
+# B is for the fixed effect to help with mixing
+# R is for residual variance
+# G is the phylogenetic/additive genetic variance
+prior1 <- list(
+  G = list(G1 = list(V = 1, nu = 0.002)),
+  R = list(V = 1, nu = 0.002)
+)
+
+##############################
+#Running models in parallel
+##############################
+
+# Parallel models with outputs saved as .rds files
+foreach(i = 1:400) %dopar% {
+  # Create the MCMCglmm
+  ##Run 1st model
+  model1 <- MCMCglmm(colony.size ~ 1, random = ~animal, family = "gaussian", prior = prior1, pedigree = ant_trees_pruned_CS[[i]], data = sxData_CS, nitt = 1100000, burnin = 100000, thin = 1000, verbose = F)
+
+  #Run 2nd model
+  model2 <- MCMCglmm(colony.size ~ 1, random = ~animal, family = "gaussian", prior = prior1, pedigree = ant_trees_pruned_CS[[i]], data = sxData_CS, nitt = 1100000, burnin = 100000, thin = 1000, verbose = F)
+
+  # Save the model as an .rds file for 1st and 2nd chain
+  saveRDS(model1, file = file.path("/CS/1st_chain", paste0("CS_phylo_sig_1M_100k_1k_", i, "_1stRun.rds")))
+  saveRDS(model2, file = file.path("/CS/2nd_chain", paste0("CS_phylo_sig_1M_100k_1k_", i, "_2ndRun.rds")))
+}
+
+#Read in the MCMCglmm objects
+setwd("/CS/1st_chain/")
+#Get list of all RDS files in the working directory
+model_files_CS <- list.files(pattern = "\\.rds$")
+#Read in all models using lapply()
+mcmc_list_CS <- lapply(model_files_CS, readRDS)
+
+
+##############################
+#Combine posterior distribution of the random effects - VCV
+##############################
+
+#Extract the VCV objects from each model output in the list and create a list of the mcmc objects
+vcv_matrices_CS <- lapply(mcmc_list_CS, function(model) model$VCV)
+#Combine the mcmc objects together
+combined_vcv_CS <- do.call(rbind, vcv_matrices_CS)
+#Assign as an mcmc object
+MCMC_combined_CS <- as.mcmc(combined_vcv_CS)
+
+
+#Calculate phylogenetic signal (heritability)
+herit_CS <- MCMC_combined_CS[ , "animal"] / (MCMC_combined_CS[ , "animal"] + MCMC_combined_CS[ , "units"])
+
+effectiveSize(herit_CS)
+
+posterior.mode(herit_CS)
+
+posterior.mode(MCMC_combined_CS[ , "animal"])
+
+posterior.mode(MCMC_combined_CS[ , "units"])
+
+#Compute 95% credible interval
+HPDinterval(herit_CS)
+
+HPDinterval(MCMC_combined_CS[ , "animal"])
+
+HPDinterval(MCMC_combined_CS[ , "units"])
+
+
+
+
+
+########################################## 
+
+#################################
+#Signal in queen mating frequency
+#################################
+
+########################################## 
+
+#Filter data
+sxData_MF <- ant_data %>% dplyr::filter(complete.cases(queen.mating.frequency), complete.cases(caste.number)) %>% dplyr::select(animal, queen.mating.frequency)
+
+#Prune tree
+ant_trees_pruned_MF <- drop.tip.multiPhylo(ant_trees, setdiff(ant_trees[[1]]$tip.label, sxData_MF$animal))
+
+#Prune database
+sxData_MF <- dplyr::filter(sxData_MF, animal %in% ant_trees_pruned_MF[[1]]$tip.label)
+
+#Check that species names in the tree and the data match
+sxData_MF$animal[which((sxData_MF$animal %in% ant_trees_pruned_MF[[1]]$tip.label) == FALSE)]	# 0 means all match
+ant_trees_pruned_MF[[1]]$tip.label[which((ant_trees_pruned_MF[[1]]$tip.label %in% sxData_MF$animal) == FALSE)]	# 0 means all match
+
+#########
+#MCMCglmm models
+#########
+
+##Set prior
+# B is for the fixed effect to help with mixing
+# R is for residual variance
+# G is the phylogenetic/additive genetic variance
+prior1 <- list(
+  G = list(G1 = list(V = 1, nu = 0.002)),
+  R = list(V = 1, nu = 0.002)
+)
+
+
+##############################
+#Running models in parallel
+##############################
+
+# Parallel models with outputs saved as .rds files
+foreach(i = 1:400) %dopar% {
+  # Create the MCMCglmm
+  ##Run 1st model
+  model1 <- MCMCglmm(queen.mating.frequency ~ 1, random = ~animal, family = "gaussian", prior = prior1, pedigree = ant_trees_pruned_MF[[i]], data = sxData_MF, nitt = 1100000, burnin = 100000, thin = 1000, verbose = F)
+
+  #Run 2nd model
+  model2 <- MCMCglmm(queen.mating.frequency ~ 1, random = ~animal, family = "gaussian", prior = prior1, pedigree = ant_trees_pruned_MF[[i]], data = sxData_MF, nitt = 1100000, burnin = 100000, thin = 1000, verbose = F)
+
+  # Save the model as an .rds file for 1st and 2nd chain
+  saveRDS(model1, file = file.path("/MF/1st_chain", paste0("MF_phylo_sig_1M_100k_1k_", i, "_1stRun.rds")))
+  saveRDS(model2, file = file.path("/MF/2nd_chain", paste0("MF_phylo_sig_1M_100k_1k_", i, "_2ndRun.rds")))
+}
+
+#Read in the MCMCglmm objects
+setwd("/MF/1st_chain/")
+#Get list of all RDS files in the working directory
+model_files_MF <- list.files(pattern = "\\.rds$")
+#Read in all models using lapply()
+mcmc_list_MF <- lapply(model_files_MF, readRDS)
+
+
+##############################
+#Combine posterior distribution of the random effects - VCV
+##############################
+
+#Extract the VCV objects from each model output in the list and create a list of the mcmc objects
+vcv_matrices_MF <- lapply(mcmc_list_MF, function(model) model$VCV)
+#Combine the mcmc objects together
+combined_vcv_MF <- do.call(rbind, vcv_matrices_MF)
+#Assign as an mcmc object
+MCMC_combined_MF <- as.mcmc(combined_vcv_MF)
+
+
+#Calculate phylogenetic signal (heritability)
+herit_MF <- MCMC_combined_MF[ , "animal"] / (MCMC_combined_MF[ , "animal"] + MCMC_combined_MF[ , "units"])
+
+posterior.mode(herit_MF)
+
+posterior.mode(MCMC_combined_MF[ , "animal"])
+
+posterior.mode(MCMC_combined_MF[ , "units"])
+
+#Compute 95% credible interval
+HPDinterval(herit_MF)
+
+HPDinterval(MCMC_combined_MF[ , "animal"])
+
+HPDinterval(MCMC_combined_MF[ , "units"])
+
+
+
+
+
+

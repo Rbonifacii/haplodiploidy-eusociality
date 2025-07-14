@@ -1,0 +1,60 @@
+renv::restore() # this should install restore the packages I have been using for this analysis so the script will be easily reproduced
+
+# install.packages("/Users/user/Downloads/phyregB_0.1.0.tar.gz",repos=NULL,type="source")
+
+library(phyregB)
+library(here)
+library(ape)
+library(phytools)
+library(dplyr)
+
+# ==== Estimate rate of eusocial evolution using phyreg package ====
+# Alan Grafen, 2014. phyreg: The Phylogenetic Regression of Grafen (1989). https://doi.org/10.32614/CRAN.package.phyreg
+
+# Ensure `here` package finds the project root
+here::i_am("scripts/regressions/phyregB/phyreg_incl_bg.R")
+
+# Load cleaned data
+insect_data <- read.csv(here("data", "datasetS1.csv"))
+insect_data <- insect_data[, c("species_name", "superorganism_bg", "haplodiploidy_inclusive")]
+
+insect_data <- insect_data %>%
+  filter(!is.na(haplodiploidy_inclusive), !is.na(superorganism_bg))
+
+#  "haplodiploidy_inclusive" = haplodiploidy as a binary variable, 1= Yes, 0 = N 
+#  "superorganism_bg" =  Boomsma & Gawne's definition of superorganismality as a binary variable 1= Yes, 0 = No
+
+# Load tree 
+tree <- read.tree(here("tree", "chestersklado_pruned.tree"))
+
+# Drop tips from tree and tree_vector not in data
+species_to_keep <- intersect(tree$tip.label, insect_data$species_name)
+tree <- drop.tip(tree, setdiff(tree$tip.label, species_to_keep))
+
+# Convert tree to internal format
+tree_vector <- phyfromphylo(tree)  
+
+# Reorder data to match tree
+insect_data <- insect_data[match(tree$tip.label, insect_data$species_name), ]
+
+# Ensure the tree species (tips.lables) match the dataset
+species_match <- all(tree$tip.label == insect_data$species_name)
+species_match
+
+# Check if insect_data$species_name is in the same order as tree$tip.label
+order_match <- all(match(tree$tip.label, insect_data$species_name) == seq_along(tree$tip.label))
+order_match
+
+# Check root node has no parent
+root_node <- setdiff(tree$edge[, 1], tree$edge[, 2])
+length(root_node)  # if == 1 then root node is correctly identified and has no parent
+
+# Run phylogenetic regression
+phylo_model <- phyreg(
+  control = superorganism_bg~1,       # Null hypothesis model (control variables)
+  test = ~ haplodiploidy_inclusive,      # Test terms (independent variables)
+  data = insect_data,               # Dataset with species traits
+  phydata = tree_vector$phy            # Converted phylogeny in internal format    
+  )
+
+saveRDS(phylo_model, file = "scripts/analyseschesters17/output/phyreg_incl_bg.rds")

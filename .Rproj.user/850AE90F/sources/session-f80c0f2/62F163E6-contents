@@ -1,0 +1,266 @@
+# ==============================================================================
+# 📜 SCRIPT PURPOSE
+# This script performs Read & Nee-style phylogenetic contrasts to test whether
+# haplodiploid clades show higher prevalence of eusociality than their non-haplodiploid
+# sister clades. The analysis includes:
+# - Identifying pure haplodiploid clades
+# - Finding appropriate sister clades
+# - Statistical testing (binomial, Wilcoxon)
+# - Robustness analysis using random sister selection
+# Repeats the analysis across six different trait combinations.
+# ==============================================================================
+
+# --- Libraries ---
+library(ape)
+library(phangorn)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(here)
+library(tidyr)
+library(ggplot2)
+library(coin)
+source(here("scripts", "readnee95" ,"readnee_functions.R"))
+
+# --- Load data and tree --- 
+insect_data <- read.csv(here("data", "datasetS1.csv"))
+tree <- read.tree(here("tree", "chestersklado_pruned.tree"))
+
+
+# --- Define trait combinations ---
+trait_combinations <- list(
+  incl_mw = c("haplodiploidy_inclusive", "eusocial_mw"),
+  incl_cy = c("haplodiploidy_inclusive", "eusocial_cy"),
+  incl_bg = c("haplodiploidy_inclusive", "superorganism_bg"),
+  strict_mw = c("haplodiploidy_strict", "eusocial_mw"),
+  strict_cy = c("haplodiploidy_strict", "eusocial_cy"),
+  strict_bg = c("haplodiploidy_strict", "superorganism_bg")
+)
+
+all_outputs <- list()
+
+for (trait_name in names(trait_combinations)) {
+  cat("\n--- Running analysis for:", trait_name, "---\n")
+  haplo_col <- trait_combinations[[trait_name]][1]
+  eusoc_col <- trait_combinations[[trait_name]][2]
+  
+  haplo_vec <- setNames(insect_data[[haplo_col]], insect_data$species_name)[tree$tip.label]
+  eusoc_vec <- setNames(insect_data[[eusoc_col]], insect_data$species_name)
+  
+  # Identify pure haplodiploid clades
+  root_node <- Ntip(tree) + 1
+  pure_clades <- find_pure_clades(tree, root_node, haplo_vec)
+  node_depths <- node.depth(tree)
+  names(node_depths) <- as.character(1:(Ntip(tree) + tree$Nnode))
+  pure_clades$node_depth <- node_depths[as.character(pure_clades$clade_node)]
+  pure_clades <- arrange(pure_clades, node_depth)
+  
+  # Find best sister clades
+  used_nodes <- integer()
+  used_tips <- character()
+  final_contrasts <- list()
+  
+  for (i in seq_len(nrow(pure_clades))) {
+    clade_row <- pure_clades[i, ]
+    focal_node <- clade_row$node
+    focal_n_species <- clade_row$n_species
+    
+    sister <- find_best_sister_clade(tree, focal_node, haplo_vec, used_nodes, used_tips)
+    if (!is.null(sister)) {
+      best_sister <- arrange(sister, levels_up, abs(sister_n_tips - focal_n_species)) %>% slice(1)
+      final_contrasts[[length(final_contrasts) + 1]] <- tibble(
+        node = clade_row$node,
+        n_species = clade_row$n_species,
+        tips = clade_row$tips,
+        parent_node = best_sister$parent_node,
+        sister_nodes = best_sister$sister_nodes,
+        sister_n_tips = best_sister$sister_n_tips,
+        sister_tips = best_sister$sister_tips,
+        levels_up = best_sister$levels_up
+      )
+      used_nodes <- union(used_nodes, Descendants(tree, as.integer(best_sister$sister_nodes), type = "all")[[1]])
+      used_tips <- union(used_tips, str_split(best_sister$sister_tips, ",\\s*")[[1]])
+    }
+  }
+  
+  contrasts_df <- bind_rows(final_contrasts)
+  
+  # Statistical analysis
+  contrast_results <- contrasts_df %>%
+    rowwise() %>%
+    mutate(
+      haplo_tips = str_split(tips, ",\\s*"),
+      sister_tips = str_split(sister_tips, ",\\s*"),
+      haplo_eusocial = sum(insect_data$species_name %in% unlist(haplo_tips) & insect_data[[eusoc_col]] == "1"),
+      haplo_total = length(unlist(haplo_tips)),
+      sister_eusocial = sum(insect_data$species_name %in% unlist(sister_tips) & insect_data[[eusoc_col]] == "1"),
+      sister_total = length(unlist(sister_tips)),
+      haplo_prop = haplo_eusocial / haplo_total,
+      sister_prop = sister_eusocial / sister_total,
+      informative = haplo_prop != sister_prop,
+      outcome = case_when(
+        haplo_prop > sister_prop ~ 1,
+        haplo_prop < sister_prop ~ 0,
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    ungroup()
+  
+  informative_contrasts <- filter(contrast_results, informative)
+  binom_test <- binom.test(sum(informative_contrasts$outcome == 1),
+                           nrow(informative_contrasts),
+                           p = 0.5, alternative = "greater")
+  
+  wilcox_data <- contrast_results %>%
+    filter(!is.na(haplo_prop), !is.na(sister_prop)) %>%
+    mutate(pair_id = row_number()) %>%
+    pivot_longer(cols = c(haplo_prop, sister_prop), names_to = "group", values_to = "prop") %>%
+    mutate(group = factor(group), pair_id = factor(pair_id))
+  
+  balanced_ids <- wilcox_data %>% count(pair_id) %>% filter(n == 2) %>% pull(pair_id)
+  wilcox_clean <- filter(wilcox_data, pair_id %in% balanced_ids)
+  
+  wilcox_test <- wilcoxsign_test(prop ~ group | pair_id, data = wilcox_clean,
+                                 distribution = approximate(nresample = 10000),
+                                 alternative = "greater")
+  
+  # Save point-estimate outputs
+  all_outputs[[trait_name]] <- list(
+    contrasts = contrast_results,
+    binom_test = binom_test,
+    wilcox_test = wilcox_test
+  )
+  write.csv(
+    contrast_results %>%
+      mutate(
+        haplo_tips = sapply(haplo_tips, paste, collapse = "; "),
+        sister_tips = sapply(sister_tips, paste, collapse = "; ")
+      ),
+    here("output", paste0("read_nee_results_", trait_name, ".csv")),
+    row.names = FALSE
+  )
+  
+  
+  # ROBUSTNESS ANALYSIS -------------------
+  set.seed(1365)
+  n_reps <- 100
+  replicate_results <- vector("list", n_reps)
+  
+  for (rep in seq_len(n_reps)) {
+    used_nodes <- integer()
+    used_tips <- character()
+    final_contrasts <- list()
+    
+    for (i in seq_len(nrow(pure_clades))) {
+      clade_row <- pure_clades[i, ]
+      focal_node <- clade_row$node
+      focal_n_species <- clade_row$n_species
+      
+      sister_candidates <- find_best_sister_clade_expanded(tree, focal_node, haplo_vec, used_nodes, used_tips)
+      
+      if (!is.null(sister_candidates)) {
+        top_candidates <- sister_candidates %>%
+          mutate(size_diff = abs(sister_n_tips - focal_n_species)) %>%
+          arrange(levels_up, size_diff) %>%
+          slice_head(n = 10)
+        
+        chosen_sister <- slice_sample(top_candidates, n = 1)
+        
+        result <- tibble(
+          rep = rep,
+          focal_node = clade_row$node,
+          n_species = clade_row$n_species,
+          tips = clade_row$tips,
+          parent_node = chosen_sister$parent_node,
+          sister_nodes = chosen_sister$sister_nodes,
+          sister_n_tips = chosen_sister$sister_n_tips,
+          sister_tips = chosen_sister$sister_tips,
+          levels_up = chosen_sister$levels_up
+        )
+        
+        final_contrasts[[length(final_contrasts) + 1]] <- result
+        
+        new_nodes <- Descendants(tree, as.integer(chosen_sister$sister_nodes), type = "all")[[1]]
+        used_nodes <- union(used_nodes, new_nodes)
+        new_tips <- str_split(chosen_sister$sister_tips, ",\\s*")[[1]]
+        used_tips <- union(used_tips, new_tips)
+      }
+    }
+    
+    replicate_results[[rep]] <- bind_rows(final_contrasts)
+  }
+  
+  saveRDS(replicate_results, here("output", paste0("read_nee_robustness_", trait_name, ".rds")))
+}
+
+saveRDS(all_outputs, here("output", "read_nee_all_trait_outputs.rds"))
+
+# === Robustness summary statistics ===
+robustness_summaries <- list()
+
+for (trait_name in names(trait_combinations)) {
+  cat("\n--- Robustness tests for:", trait_name, "---\n")
+  
+  replicate_results <- readRDS(here("output", paste0("read_nee_robustness_", trait_name, ".rds")))
+  eusoc_col <- trait_combinations[[trait_name]][2]
+  this_data <- insect_data[, c("species_name", eusoc_col)]
+  colnames(this_data)[2] <- "eusocial"
+  
+  enriched <- purrr::map_df(replicate_results, function(df) {
+    df %>%
+      rowwise() %>%
+      mutate(
+        haplo_tips = str_split(tips, ",\\s*") %>% unlist() %>% trimws(),
+        sister_tips = str_split(sister_tips, ",\\s*") %>% unlist() %>% trimws(),
+        haplo_eusocial = sum(this_data$species_name %in% haplo_tips & this_data$eusocial == "1"),
+        sister_eusocial = sum(this_data$species_name %in% sister_tips & this_data$eusocial == "1"),
+        haplo_total = length(haplo_tips),
+        sister_total = length(sister_tips),
+        haplo_prop = haplo_eusocial / haplo_total,
+        sister_prop = sister_eusocial / sister_total,
+        informative = haplo_prop != sister_prop,
+        outcome = case_when(
+          haplo_prop > sister_prop ~ 1,
+          haplo_prop < sister_prop ~ 0,
+          TRUE ~ NA_real_
+        )
+      ) %>%
+      ungroup()
+  })
+  
+  binomial_summary <- enriched %>%
+    filter(informative) %>%
+    group_by(rep) %>%
+    summarise(
+      n = n(),
+      haplo_wins = sum(outcome == 1),
+      p_value = binom.test(haplo_wins, n, p = 0.5, alternative = "greater")$p.value,
+      prop_haplo_wins = mean(outcome == 1, na.rm = TRUE),
+      majority = case_when(
+        haplo_wins > n / 2 ~ "haplo",
+        haplo_wins < n / 2 ~ "sister",
+        TRUE ~ "tie"
+      ),
+      .groups = "drop"
+    )
+  
+  wilcox_summary <- enriched %>%
+    filter(!is.na(haplo_prop), !is.na(sister_prop)) %>%
+    group_by(rep) %>%
+    summarise(
+      p_value = tryCatch({
+        wilcox.test(haplo_prop, sister_prop, paired = TRUE, alternative = "greater", exact = FALSE)$p.value
+      }, error = function(e) NA_real_)
+    )
+  
+  robustness_summaries[[trait_name]] <- list(
+    binomial_summary = binomial_summary,
+    wilcox_summary = wilcox_summary
+  )
+  
+  write.csv(binomial_summary, here("output", paste0("robustness_binomial_", trait_name, ".csv")), row.names = FALSE)
+  write.csv(wilcox_summary, here("output", paste0("robustness_wilcox_", trait_name, ".csv")), row.names = FALSE)
+}
+
+saveRDS(robustness_summaries, here("output", "read_nee_robustness_summaries.rds"))

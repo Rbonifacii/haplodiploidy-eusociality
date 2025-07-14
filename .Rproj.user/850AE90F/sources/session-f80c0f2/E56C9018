@@ -1,0 +1,26 @@
+{
+    "id": "E56C9018",
+    "path": "~/Downloads/Phylogenetic_signal_MCMCglmm_400_trees.R",
+    "project_path": null,
+    "type": "r_source",
+    "hash": "2926096896",
+    "contents": "",
+    "dirty": false,
+    "created": 1752153903489.0,
+    "source_on_save": false,
+    "relative_order": 6,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "19,22",
+        "scrollLine": "128"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1752498885,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1752498885444,
+    "read_only": false,
+    "read_only_alternatives": []
+}

@@ -1,0 +1,113 @@
+# ==============================================================================
+# Testing Correlated Evolution of Eusociality and Haplodiploidy using corHMM
+# ==============================================================================
+
+# 1. Setup ---------------------------------------------------------------------
+
+set.seed(2025)
+
+library(corHMM)    # Phylogenetic HMMs
+library(ape)       # Tree manipulation
+library(dplyr)     # Data wrangling
+library(here)      # Project-relative paths
+library(phytools)  # For simmap visualization
+
+# 2. Data Preparation ----------------------------------------------------------
+
+# Read and ladderize phylogeny
+tree <- read.tree(here("trees", "chesters17", "chestersklado_pruned_to_data.tree")) %>%
+  compute.brlen(method = "Grafen")
+
+tree <- ladderize(tree)
+
+# Read and clean trait data
+dat_raw <- read.csv(here("data", "data_matched_to_chesters17_klado.csv"), stringsAsFactors = FALSE)
+
+dat <- dat_raw %>%
+  select(sp = species_name, X = haplodiploidy_inclusive, S = superorganism_bg) %>%
+  mutate(across(c(X, S), as.character)) %>%
+  filter(!is.na(as.numeric(X)), !is.na(as.numeric(S))) %>%
+  mutate(across(c(X, S), as.numeric))
+
+# Only keep species present in both tree and data
+common_species <- intersect(tree$tip.label, dat$sp)
+
+# Prune tree and data
+tree_pruned <- drop.tip(tree, setdiff(tree$tip.label, common_species))
+dat_pruned  <- dat[dat$sp %in% common_species, ]
+
+# Reorder data to match pruned tree
+dat_pruned <- dat_pruned[match(tree_pruned$tip.label, dat_pruned$sp), ]
+stopifnot(all(tree_pruned$tip.label == dat_pruned$sp))  # should now be TRUE
+
+# Prune tree to match data
+keep <- dat_pruned$sp
+tree_pruned <- drop.tip(tree, setdiff(tree$tip.label, keep))
+dat <- dat[match(tree_pruned$tip.label, dat$sp), ]
+stopifnot(all(tree_pruned$tip.label == dat$sp))
+
+# 3. Model Definitions ---------------------------------------------------------
+
+# 3.1 Dependent (Pagel’s correlated evolution) model
+dep_mat <- getStateMat4Dat(dat, collapse = FALSE, indep = FALSE)$rate.mat
+
+# 3.2 Independent model
+indep_mat <- getStateMat4Dat(dat, collapse = FALSE, indep = TRUE)$rate.mat
+
+# 3.3 Hidden Markov Independent Model (HMIM)
+state_mats   <- list(indep_mat, indep_mat)
+rate_cat_mat <- equateStateMatPars(getRateCatMat(2), 1:2)
+HMIM_mat     <- getFullMat(state_mats, rate_cat_mat)
+
+# 3.4 Hidden Markov Dependent Model (MIM Dependent)
+state_mats_dep <- list(dep_mat, dep_mat)
+HMIM_dep_mat    <- getFullMat(state_mats_dep, rate_cat_mat)
+
+# 4. Model Fitting -------------------------------------------------------------
+
+fit_dep      <- corHMM(tree_pruned, dat, rate.cat = 1, rate.mat = dep_mat, model = "ARD", node.states = "none", collapse = TRUE, nstarts = 0, root.p = c(1, 0, 0, 0))
+fit_ind      <- corHMM(tree_pruned, dat, rate.cat = 1, rate.mat = indep_mat, model = "ARD", node.states = "none", collapse = TRUE, nstarts = 0, root.p = c(1, 0, 0, 0))
+fit_HMIM     <- corHMM(tree_pruned, dat, rate.cat = 2, rate.mat = HMIM_mat, model = "ARD", node.states = "none", collapse = TRUE, nstarts = 0, root.p = c(1, 0, 0, 0))
+fit_HMIM_dep  <- corHMM(tree_pruned, dat, rate.cat = 2, rate.mat = HMIM_dep_mat, model = "ARD", node.states = "none", collapse = TRUE, nstarts = 0, root.p = c(1, 0, 0, 0))
+
+# 5. Model Comparison ----------------------------------------------------------
+
+aic_table <- tibble::tibble(
+  model         = c("Dependent", "Independent", "HMIM", "HMIM Dependent"),
+  logLik        = c(fit_dep$loglik, fit_ind$loglik, fit_HMIM$loglik, fit_HMIM_dep$loglik),
+  AIC           = c(fit_dep$AIC, fit_ind$AIC, fit_HMIM$AIC, fit_HMIM_dep$AIC),
+  delta_AIC     = AIC - min(AIC),
+  Akaike_weight = exp(-0.5 * delta_AIC) / sum(exp(-0.5 * delta_AIC))
+)
+print(aic_table)
+
+readr::write_csv(aic_table, here::here("scripts","analyseschesters17","output", "HMIM_AIC_table_incl_bg.csv"))
+
+# 6. Visualization -------------------------------------------------------------
+
+# Visualize model structure for HMIM and MIM Dependent
+plotMKmodel(HMIM_mat, rate.cat = 2, display = "row", text.scale = 0.7)
+plotMKmodel(HMIM_dep_mat, rate.cat = 2, display = "row", text.scale = 0.7)
+
+# Stochastic character mapping for MIM Dependent
+phy   <- fit_HMIM_dep$phy
+data  <- fit_HMIM_dep$data
+model <- fit_HMIM_dep$solution
+model[is.na(model)] <- 0
+diag(model) <- -rowSums(model)
+
+simmap <- makeSimmap(tree = phy, data = data, model = model, rate.cat = 2, nSim = 1, nCores = 1)
+par(mfrow=c(1,1))
+phytools::plotSimmap(simmap[[1]],  fsize = 0.1)
+
+# 7. Save Model Fits 
+
+saveRDS(list(
+  fit_dep = fit_dep,
+  fit_ind = fit_ind,
+  fit_HMIM = fit_HMIM,
+  fit_MIM_dep = fit_HMIM_dep
+), file = here("scripts","analyseschesters17","output", "HMIM_model_fits_incl_bg.rds"))
+
+# --- End of script ---
+

@@ -1,0 +1,15 @@
+# Load libraries
+library(ape)
+library(phytools)
+library(here)
+
+# Read in original tree with polytomies
+tree <- read.tree(here("tree", "polytomy_tree.tre"))
+
+# Resolve polytomies randomly in 1000 trees
+set.seed(2025)  # for reproducibility
+resolved_trees <- replicate(1000, multi2di(tree, random = TRUE), simplify = FALSE)
+resolved_trees <- as.multiPhylo(resolved_trees)
+
+# Save resolved trees
+write.tree(resolved_trees, file = here("output", "resolved_1000_trees.tre"))

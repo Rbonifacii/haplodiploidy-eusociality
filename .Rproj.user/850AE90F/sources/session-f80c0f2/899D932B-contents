@@ -1,0 +1,512 @@
+# ---------------------------=
+# 📜 SCRIPT PURPOSE:
+# This script identifies all pure haplodiploid clades in a phylogenetic tree
+# and finds their corresponding sister clades. A valid Read & Nee contrast
+# occurs when the sister clade contains any non-haplodiploid (state == 0) species.
+# ---------------------------=
+
+# --- Libraries ---
+library(ape)        
+library(phangorn)   
+library(dplyr)      
+library(purrr)     
+library(tibble) 
+library(stringr)
+library(here) 
+library(tidyr)
+source(here("scripts", "readnee95" "readnee_functions.R"))
+
+# --- Load data and tree --- 
+insect_data <- read.csv(here("data", "datasetS1.csv"))
+
+tree <- read.tree(here("tree", "chestersklado_pruned.tree"))
+
+# --- Preprocess trait vector ---
+haplo_vec <- setNames(insect_data$haplodiploidy_inclusive, insect_data$species_name)
+haplo_vec <- haplo_vec[tree$tip.label]  
+haplo_vec 
+
+# --- Find pure clades ---
+root_node <- Ntip(tree) + 1
+pure_clades <- find_pure_clades(tree, root_node, haplo_vec)
+cat("Found", nrow(pure_clades), "pure haplodiploid clades\n")
+
+# --- For each pure clade, get its sister clade(s) ---
+
+# --- Step 1: Sort pure clades ---
+
+all_node_depths <- node.depth(tree)
+names(all_node_depths) <- as.character(1:(Ntip(tree) + tree$Nnode))
+
+pure_clades$node_depth <- all_node_depths[as.character(pure_clades$clade_node)]
+pure_clades <- pure_clades %>% arrange(node_depth)
+pure_clades 
+
+# --- Find contrasts ---
+# Prioritises the clade that is most similar in size to the focal clade
+used_nodes <- integer()
+used_tips <- character()
+final_contrasts <- list()
+
+for (i in seq_len(nrow(pure_clades))) {
+  clade_row <- pure_clades[i, ]
+  
+  focal_node <- clade_row$node
+  focal_n_species <- clade_row$n_species
+  
+ # Get sister candidates
+  sister_candidates <- find_best_sister_clade(
+    tree = tree,
+    focal_node = focal_node,
+    haplo_vec = haplo_vec,
+    used_nodes = used_nodes,
+    used_tips = used_tips
+  )
+  
+  if (!is.null(sister_candidates)) {
+    # Pick closest in size (i.e., smallest difference in number of tips)
+    best_sister <- sister_candidates %>%
+      mutate(size_difference = abs(sister_n_tips - focal_n_species)) %>%
+      arrange(levels_up, size_difference) %>%
+      slice(1)
+    
+    result <- tibble(
+      node = clade_row$node,
+      n_species = clade_row$n_species,
+      tips = clade_row$tips,
+      parent_node = best_sister$parent_node,
+      sister_nodes = best_sister$sister_nodes,
+      sister_n_tips = best_sister$sister_n_tips,
+      sister_has_non_haplo = best_sister$sister_has_non_haplo,
+      sister_tips = best_sister$sister_tips,
+      levels_up = best_sister$levels_up
+    )
+    
+    final_contrasts[[length(final_contrasts) + 1]] <- result
+    
+    new_nodes <- Descendants(tree, as.integer(best_sister$sister_nodes), type = "all")[[1]]
+    used_nodes <- union(used_nodes, new_nodes)
+    
+    new_tips <- str_split(best_sister$sister_tips, ",\\s*")[[1]]
+    used_tips <- union(used_tips, new_tips)
+    
+  } else {
+    warning(glue::glue("⚠️ No usable sister clade found for node {focal_node} (row {i})"))
+  }
+}
+
+# --- Final output ---
+final_contrasts_df <- bind_rows(final_contrasts)
+print(final_contrasts_df)
+
+# --- Save ---
+ write.csv(final_contrasts_df,
+file = "scripts/analyseschesters17/output/read_nee_contrasts_incl_bg.csv",
+row.names = FALSE
+)
+
+
+################ PART B: APPLY STATISTICAL, TEST ##############
+
+#  --- Option 1: Binomial Test ---
+
+readnee_prop_results <- final_contrasts_df %>%
+  rowwise() %>%
+  mutate(
+    haplo_tips = str_split(tips, ",\\s*"),
+    sister_tips = str_split(sister_tips, ",\\s*"),
+    
+    haplo_eusocial = {
+      tipset <- trimws(unlist(haplo_tips))
+      sum(insect_data$species_name %in% tipset & insect_data$superorganism_bg == "1", na.rm = TRUE)
+    },
+    haplo_total = {
+      tipset <- trimws(unlist(haplo_tips))
+      sum(insect_data$species_name %in% tipset)
+    },
+    
+    sister_eusocial = {
+      tipset <- trimws(unlist(sister_tips))
+      sum(insect_data$species_name %in% tipset & insect_data$superorganism_bg == "1", na.rm = TRUE)
+    },
+    sister_total = {
+      tipset <- trimws(unlist(sister_tips))
+      sum(insect_data$species_name %in% tipset)
+    },
+    
+    haplo_prop = haplo_eusocial / haplo_total,
+    sister_prop = sister_eusocial / sister_total,
+    
+    informative = haplo_prop != sister_prop,
+    outcome = case_when(
+      haplo_prop > sister_prop ~ 1,
+      haplo_prop < sister_prop ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+
+readnee_prop_results %>%
+  select(tips, sister_tips, haplo_eusocial, sister_eusocial, informative, outcome) %>%
+  head(10)
+
+informative_contrasts <- readnee_prop_results %>%
+  filter(informative == TRUE)
+
+# Count the outcomes
+successes <- sum(informative_contrasts$outcome == 1, na.rm = TRUE)
+n_trials <- sum(!is.na(informative_contrasts$outcome))
+
+# Run the binomial test (null = 50:50)
+binom_test <- binom.test(successes, n_trials, p = 0.5, alternative = "greater")
+print(binom_test)
+
+#  --- Option 2: Wilcoxon signed-rank test
+
+# permutation-based Wilcoxon signed-rank test
+library(coin)
+
+# Prepare the long-format data
+wilcox_long <- readnee_prop_results %>%
+  filter(!is.na(haplo_prop) & !is.na(sister_prop)) %>%
+  mutate(pair_id = row_number()) %>%
+  select(pair_id, haplo_prop, sister_prop) %>%
+  pivot_longer(cols = c(haplo_prop, sister_prop),
+               names_to = "group",
+               values_to = "prop") %>%
+  mutate(
+    group = factor(group),
+    pair_id = factor(pair_id)  
+  )
+
+# Check balance
+table(wilcox_long$pair_id)
+
+# Run Wilcoxon test only on balanced data (both values per pair)
+balanced_ids <- wilcox_long %>%
+  group_by(pair_id) %>%
+  tally() %>%
+  filter(n == 2) %>%
+  pull(pair_id)
+
+wilcox_clean <- wilcox_long %>%
+  filter(pair_id %in% balanced_ids)
+
+# Run the permutation-based Wilcoxon test
+wilcox_perm_test <- wilcoxsign_test(prop ~ group | pair_id,
+                                    data = wilcox_clean,
+                                    distribution = approximate(nresample = 10000),
+                                    alternative = "greater" )
+
+# Show results
+print(wilcox_perm_test)
+
+# ---------------------------
+# ROBUSTNESS CHECKS: VARYING SISTER CLADE SELECTION
+# ---------------------------
+# This section implements a robustness test by repeating the full Read & Nee
+# contrast identification process multiple times. In each iteration, the 
+# sister clade for each haplodiploid clade is randomly selected from the top 
+# 10 candidates most closely matched in species number.
+
+# Each replicate ensures phylogenetic independence by tracking used species/nodes.
+
+# Output: A list of contrast datasets (one per replicate), and statistical
+# summaries across replicates.
+
+
+# --- Load Data ---
+insect_data <- read.csv(here("data", "datasetS1"))
+insect_data <- insect_data[, c("species_name", "superorganism_bg", "haplodiploidy_inclusive")]
+
+tree <- read.tree(here("trees", "chesters17", "chestersklado_pruned_to_data.tree"))
+tree <- compute.brlen(tree, method = "Grafen")
+
+haplo_vec <- setNames(insect_data$haplodiploid_inclusive, insect_data$species_name)
+haplo_vec <- haplo_vec[tree$tip.label]
+haplo_vec
+
+# --- Repeated robustness loop ---
+set.seed(1365)
+
+root_node <- Ntip(tree) + 1
+pure_clades <- find_pure_clades(tree, root_node, haplo_vec)
+pure_clades
+
+#--- Sort pure clades ---
+# Use clade_node to get depth
+all_node_depths <- node.depth(tree)
+names(all_node_depths) <- as.character(1:(Ntip(tree) + tree$Nnode))
+
+pure_clades$node_depth <- all_node_depths[as.character(pure_clades$clade_node)]
+pure_clades <- pure_clades %>% arrange(node_depth)
+pure_clades 
+
+n_reps <- 100
+replicate_results <- vector("list", n_reps)
+
+for (rep in 1:n_reps) {
+  used_nodes <- integer()
+  used_tips <- character()
+  final_contrasts <- list()
+  
+  for (i in seq_len(nrow(pure_clades))) {
+    clade_row <- pure_clades[i, ]
+    focal_node <- clade_row$node
+    focal_n_species <- clade_row$n_species
+    
+    sister_candidates <- find_best_sister_clade_expanded(tree, focal_node, haplo_vec, used_nodes, used_tips)
+    
+    if (!is.null(sister_candidates)) {
+      top_candidates <- sister_candidates %>%
+        mutate(size_diff = abs(sister_n_tips - focal_n_species)) %>%
+        arrange(levels_up, size_diff) %>%
+        slice_head(n = 10)
+      
+      chosen_sister <- slice_sample(top_candidates, n = 1)
+      
+      result <- tibble(
+        rep = rep,
+        focal_node = clade_row$node,
+        n_species = clade_row$n_species,
+        tips = clade_row$tips,
+        parent_node = chosen_sister$parent_node,
+        sister_nodes = chosen_sister$sister_nodes,
+        sister_n_tips = chosen_sister$sister_n_tips,
+        sister_tips = chosen_sister$sister_tips,
+        levels_up = chosen_sister$levels_up
+      )
+      
+      final_contrasts[[length(final_contrasts) + 1]] <- result
+      
+      new_nodes <- Descendants(tree, as.integer(chosen_sister$sister_nodes), type = "all")[[1]]
+      used_nodes <- union(used_nodes, new_nodes)
+      new_tips <- str_split(chosen_sister$sister_tips, ",\\s*")[[1]]
+      used_tips <- union(used_tips, new_tips)
+    }
+  }
+  replicate_results[[rep]] <- bind_rows(final_contrasts)
+}
+
+replicate_results
+
+# --- Statistical Test Across Replicates ---
+
+# Combine all replicates
+eusocial_results <- bind_rows(replicate_results)
+eusocial_results 
+
+# Add calculated columns
+eusocial_results <- eusocial_results %>%
+  rowwise() %>%
+  mutate(
+    haplo_tips = str_split(tips, ",\\s*"),
+    sister_tips = str_split(sister_tips, ",\\s*"),
+    
+    haplo_eusocial = {
+      tipset <- trimws(unlist(haplo_tips))
+      sum(insect_data$species_name %in% tipset & insect_data$superorganism_bg == 1, na.rm = TRUE)
+    },
+    haplo_total = {
+      tipset <- trimws(unlist(haplo_tips))
+      sum(insect_data$species_name %in% tipset)
+    },
+    
+    sister_eusocial = {
+      tipset <- trimws(unlist(sister_tips))
+      sum(insect_data$species_name %in% tipset & insect_data$superorganism_bg == 1, na.rm = TRUE)
+    },
+    sister_total = {
+      tipset <- trimws(unlist(sister_tips))
+      sum(insect_data$species_name %in% tipset)
+    },
+    
+    haplo_prop = ifelse(haplo_total > 0, haplo_eusocial / haplo_total, NA_real_),
+    sister_prop = ifelse(sister_total > 0, sister_eusocial / sister_total, NA_real_),
+    
+    informative = haplo_prop != sister_prop,
+    outcome = case_when(
+      haplo_prop > sister_prop ~ 1,
+      haplo_prop < sister_prop ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+
+eusocial_results
+
+replicate_summaries <- eusocial_results %>%
+  filter(informative) %>%
+  group_by(rep) %>%
+  summarise(
+    n = n(),
+    haplo_better = sum(outcome == 1, na.rm = TRUE),
+    sister_better = sum(outcome == 0, na.rm = TRUE),
+    ties = sum(is.na(outcome)),
+    prop_haplo_wins = mean(outcome == 1, na.rm = TRUE),
+    majority = case_when(
+      haplo_better > sister_better ~ 1,
+      haplo_better < sister_better ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+
+summary_across_reps <- replicate_summaries %>%
+  summarise(
+    total_reps = n(),
+    majority_haplo = sum(majority == 1, na.rm = TRUE),
+    majority_sister = sum(majority == 0, na.rm = TRUE),
+    ties = sum(is.na(majority)),
+    prop_reps_haplo_wins = mean(majority == 1, na.rm = TRUE),
+    avg_prop_haplo_wins_within_rep = mean(prop_haplo_wins, na.rm = TRUE)
+  )
+summary_across_reps
+
+replicate_pvalues <- eusocial_results %>%
+  filter(informative) %>%
+  group_by(rep) %>%
+  summarise(
+    n = n(),
+    haplo_better = sum(outcome == 1, na.rm = TRUE),
+    total_tested = sum(outcome %in% c(0, 1)),
+    p_value = binom.test(haplo_better, total_tested, p = 0.5, alternative = "greater")$p.value
+  )
+
+replicate_pvalues
+
+# NB. Binomial tests are unreliable (and often meaningless) with very small samples 
+
+summary(replicate_pvalues$p_value)
+replicate_pvalues
+mean(replicate_pvalues$p_value < 0.05, na.rm = TRUE)
+hist(replicate_pvalues$p_value, breaks = 20, main = "P-values from binomial tests per replicate")
+
+
+# --- Save results
+write.csv(
+  eusocial_results,
+  file = "output/read_nee_robustness_incl_bg.csv",
+  row.names = FALSE
+)
+
+# --- Option 2: Wilcoxon Signed-Rank Test Across Proportion Differences
+
+# All 8 contrasts, even if some diffs = 0
+diffs <- eusocial_results %>%
+  group_by(rep, focal_node) %>%
+  summarise(diff = haplo_prop - sister_prop, .groups = "drop") %>%
+  group_by(rep) %>%
+  summarise(median_diff = median(diff, na.rm = TRUE), .groups = "drop")
+
+# Permutation test across replicate medians
+obs_median <- median(diffs$median_diff, na.rm = TRUE)
+
+set.seed(123)
+perm_medians <- replicate(10000, {
+  signs <- sample(c(-1, 1), length(diffs$median_diff), replace = TRUE)
+  median(signs * diffs$median_diff)
+})
+
+p_perm <- mean(perm_medians >= obs_median)
+cat("Permutation p-value:", p_perm, "\n")
+
+
+
+# If I run the analysis 100 times, each time choosing different sister clades, 
+# do I always get a non-significant result? Or does it sometimes become significant?
+
+# --- For each replicate
+
+eusocial_results
+
+replicate_pvals <- eusocial_results %>%
+  group_by(rep) %>%
+  summarise(
+    p_value = tryCatch({
+      diffs <- haplo_prop - sister_prop
+      if (sum(!is.na(diffs)) >= 2 && any(diffs != 0, na.rm = TRUE)) {
+        wilcox.test(
+          haplo_prop, sister_prop,
+          paired = TRUE,
+          alternative = "greater",
+          exact = FALSE  # 🔥 This avoids failure when tied or small sample
+        )$p.value
+      } else {
+        NA_real_
+      }
+    }, error = function(e) NA_real_),
+    .groups = "drop"
+  )
+
+replicate_pvals
+mean(replicate_pvals$p_value < 0.05, na.rm = TRUE)
+
+hist(replicate_pvals$p_value, breaks = 20, main = "P-values across replicate contrast sets")
+abline(v = 0.05, col = "red", lty = 2)
+
+
+## Visualisation of results
+# 1. Histogram of p-values
+library(ggplot2)
+
+ggplot(summary_df, aes(x = p_val)) +
+  geom_histogram(binwidth = 0.05, fill = "grey60", colour = "black") +
+  geom_vline(xintercept = 0.05, colour = "red", linetype = "dashed") +
+  labs(
+    title = "Distribution of Binomial Test p-values Across Replicates",
+    x = "p-value",
+    y = "Number of Replicates"
+  ) +
+  theme_minimal()
+
+# Histogram of Proportion of Successes
+ggplot(summary_df, aes(x = prop_success)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", colour = "black") +
+  geom_vline(xintercept = 0.5, colour = "red", linetype = "dashed") +
+  labs(
+    title = "Proportion of Contrasts with Higher Eusociality in Haplodiploid Clades",
+    x = "Proportion of Successes",
+    y = "Number of Replicates"
+  ) +
+  theme_minimal()
+
+# Summary Table
+mean(summary_df$prop_success)
+mean(summary_df$p_val < 0.05)
+
+
+
+
+
+
+library(ggplot2)
+# Count by ‘majority’ in replicate_summaries
+maj_counts <- replicate_summaries %>%
+  count(majority, name="n") %>%
+  mutate(majority = factor(majority,
+                           levels = c(1, 0, NA),
+                           labels = c("Haplo majority", "Sister majority", "Tie")))
+
+ggplot(maj_counts, aes(x = majority, y = n, fill = majority)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "Majority Outcome Across Replicates",
+    x = "Outcome",
+    y = "Replicate Count"
+  ) +
+  theme_minimal()
+
+
+# Using replicate_pvalues (binomial) or replicate_pvals (Wilcoxon)
+ggplot(replicate_pvalues, aes(x = p_value)) +
+  geom_histogram(binwidth = 0.05, fill = "lightgreen", color = "white") +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "Binomial Test P-Value Distribution",
+    x = "P-value",
+    y = "Number of Replicates"
+  ) +
+  theme_minimal()
+
+

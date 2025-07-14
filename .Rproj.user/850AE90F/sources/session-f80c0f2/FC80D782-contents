@@ -1,0 +1,115 @@
+# ==============================================================================
+# FUNCTIONS: Identifying Independent Contrasts via Read & Nee (1995)
+# ==============================================================================
+
+# This script defines two core functions used to identify phylogenetically 
+# independent contrasts following the Read & Nee (1995) method. These contrasts 
+# allow comparative tests of trait evolution that avoid pseudoreplication caused 
+# by shared ancestry.
+
+
+# Required packages: ape, phangorn, dplyr, purrr, tibble, stringr
+
+# ------------------------------------------------------------------------------
+
+library(phytools)
+library(ape)
+library(dplyr)
+library(stringr)
+
+# ==============================================================================
+# 🔧 FUNCTION: find_pure_clades()
+# Identifies monophyletic clades composed entirely of haplodiploid species (1s)
+# Includes singletons, 2-species mixed clades, and larger pure clades.
+# ==============================================================================
+
+find_pure_clades <- function(tree, node, haplo_vec) {
+  desc_tips <- tree$tip.label[Descendants(tree, node, type = "tips")[[1]]]
+  trait_vals <- haplo_vec[desc_tips]
+  clean_vals <- trait_vals[!is.na(trait_vals)]
+  
+  if (length(clean_vals) == 0) return(NULL)
+  
+  # Singleton
+  if (length(desc_tips) == 1 && trait_vals == 1) {
+    tip_index <- which(tree$tip.label == desc_tips)
+    parent_node <- Ancestors(tree, tip_index, type = "parent")
+    return(tibble(
+      node = tip_index,
+      clade_node = parent_node,
+      n_species = 1,
+      tips = desc_tips
+    ))
+  }
+  
+  # All haplodiploid
+  if (length(desc_tips) >= 2 && all(clean_vals == 1)) {
+    return(tibble(
+      node = node,
+      clade_node = node,
+      n_species = length(desc_tips),
+      tips = paste(desc_tips, collapse = ", ")
+    ))
+  }
+  
+  # Two-species clade with one haplodiploid
+  if (length(desc_tips) == 2 && sum(trait_vals == 1, na.rm = TRUE) == 1) {
+    haplo_tip <- desc_tips[which(trait_vals == 1)]
+    haplo_tip_index <- which(tree$tip.label == haplo_tip)
+    clade_mrca <- getMRCA(tree, desc_tips)
+    children <- Children(tree, clade_mrca)
+    
+    matching_child <- NULL
+    for (child in children) {
+      desc <- Descendants(tree, child, type = "tips")[[1]]
+      if (haplo_tip_index %in% desc) {
+        matching_child <- child
+        break
+      }
+    }
+    
+    return(tibble(
+      node = matching_child,
+      clade_node = clade_mrca,
+      n_species = 1,
+      tips = haplo_tip
+    ))
+  }
+  
+  # Recurse on child nodes
+  children <- Children(tree, node)
+  if (length(children) == 0) return(NULL)
+  
+  results <- lapply(children, function(child) find_pure_clades(tree, child, haplo_vec))
+  return(bind_rows(results))
+}
+
+# ==============================================================================
+# 🔧 FUNCTION: find_best_sister_clade()
+# Finds the best-matching sister clade (non-haplodiploid, unused) for a given 
+# focal clade node. Climbs tree upward if no immediate sister is suitable.
+# ==============================================================================
+
+find_best_sister_clade <- function(tree, focal_node, haplo_vec, used_nodes = integer(), used_tips = character()) {
+  level_up <- 0
+  current_node <- focal_node
+  
+  get_all_internal_nodes <- function(tree, node) {
+    children <- Children(tree, node)
+    if (length(children) == 0) return(node)
+    return(c(node, unlist(lapply(children, get_all_internal_nodes, tree = tree))))
+  }
+  
+  repeat {
+    parent <- Ancestors(tree, current_node, type = "parent")
+    if (length(parent) == 0) return(NULL)
+    
+    siblings <- setdiff(Children(tree, parent), current_node)
+    if (length(siblings) == 0) {
+      current_node <- parent
+      level_up <- level_up + 1
+      next
+    }
+    
+    candidate_nodes <- unique(unlist(lapply(siblings, function(s) get_all_internal_nodes(tr
+                                                                                         

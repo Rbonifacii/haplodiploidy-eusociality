@@ -1,0 +1,61 @@
+library(tidyverse)
+library(ape)
+library(MCMCglmm)
+library(doParallel)
+library(coda)
+library(here)
+
+registerDoParallel(40)
+
+# Read trait data
+eusoc_data <- read.csv(here("data", "eusociality_traits.csv")) %>% 
+  rename(animal = species)
+
+# Read resolved trees
+resolved_trees <- read.tree(here("output", "resolved_1000_trees.tre"))
+
+# Traits to analyze (binary coded: 0/1)
+traits <- c("eusociality", "sex.determination", "mating.system", "parental.care", "live.in.food.source")
+
+# Prior for categorical trait models
+prior_bin <- list(
+  G = list(G1 = list(V = 1, nu = 0.002)),
+  R = list(V = 1, fix = 1)
+)
+
+# Loop over each trait
+for (trait in traits) {
+  message("Running models for: ", trait)
+  
+  sxData <- eusoc_data %>%
+    filter(complete.cases(.data[[trait]])) %>%
+    select(animal, !!sym(trait))
+  
+  # Prune trees to include only species in data
+  pruned_trees <- drop.tip.multiPhylo(resolved_trees, setdiff(resolved_trees[[1]]$tip.label, sxData$animal))
+  
+  # Filter data to match tree tips
+  sxData <- filter(sxData, animal %in% pruned_trees[[1]]$tip.label)
+  
+  # Save filtered dataset and trees
+  write.csv(sxData, here("output", paste0("data_", trait, ".csv")), row.names = FALSE)
+  write.tree(pruned_trees, here("output", paste0("trees_", trait, ".tre")))
+  
+  # Run MCMCglmm models in parallel
+  foreach(i = 1:1000) %dopar% {
+    model <- MCMCglmm(
+      formula = as.formula(paste0(trait, " ~ 1")),
+      random = ~animal,
+      family = "categorical",
+      prior = prior_bin,
+      pedigree = pruned_trees[[i]],
+      data = sxData,
+      nitt = 1100000,
+      burnin = 100000,
+      thin = 1000,
+      verbose = FALSE
+    )
+    
+    saveRDS(model, here("output", trait, paste0(trait, "_", i, ".rds")))
+  }
+}

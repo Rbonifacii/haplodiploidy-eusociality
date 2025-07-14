@@ -1,0 +1,119 @@
+# --- Tidy and reproducible script for ancestral state plotting ---
+
+# Load required packages
+library(ape)
+library(phytools)
+library(ggtree)
+library(ggnewscale)
+library(ggplot2)
+library(dplyr)
+library(here)
+library(tibble)
+library(ggtreeExtra)
+
+# Load tree and data
+tree <- read.tree(here("trees", "chesters17", "chestersklado_pruned_to_data.tree"))
+tree <- compute.brlen(tree, method = "Grafen")
+
+df <- read.csv(here("data", "data_matched_to_chesters17_klado.csv"), stringsAsFactors = FALSE)
+df <- df %>%
+  mutate(across(c(haplodiploidy_inclusive, haplodiploidy_strict, eusocial_mw, eusocial_cy, superorganism_bg),
+                ~ factor(trimws(as.character(.x)), levels = c("0", "1"))))
+
+# Define traits and interaction
+trait_name <- "ploidyIncl_eusocial_mw"
+interaction_defs <- list(
+  ploidyIncl_eusocial_mw = c("haplodiploidy_inclusive", "eusocial_mw"),
+  ploidyIncl_eusocial_cy = c("haplodiploidy_inclusive", "eusocial_cy"),
+  ploidyIncl_superorganism_bg = c("haplodiploidy_inclusive", "superorganism_bg"),
+  ploidyStr_eusocial_mw = c("haplodiploidy_strict", "eusocial_mw"),
+  ploidyStr_eusocial_cy = c("haplodiploidy_strict", "eusocial_cy"),
+  ploidyStr_superorganism_bg = c("haplodiploidy_strict", "superorganism_bg")
+)
+
+possible_states <- c("0.0", "1.0", "0.1", "1.1")
+state_colors <- c("0.0" = "gray60", "1.0" = "skyblue", "0.1" = "orange", "1.1" = "forestgreen")
+
+# Prepare combined trait
+cols <- interaction_defs[[trait_name]]
+df[[trait_name]] <- factor(interaction(df[[cols[1]]], df[[cols[2]]], drop = TRUE), levels = possible_states)
+trait <- df[[trait_name]]
+names(trait) <- df$species_name
+
+# Prune and root the tree
+tree <- drop.tip(tree, setdiff(tree$tip.label, names(trait)[!is.na(trait)]))
+
+tree <- root(tree, outgroup = tree$tip.label[1], resolve.root = TRUE)
+tree <- multi2di(tree)
+trait <- trait[tree$tip.label]
+
+# Run ancestral state reconstruction
+states_vec <- factor(as.character(trait), levels = possible_states)
+names(states_vec) <- tree$tip.label
+fit <- fitMk(tree, states_vec, model = "ARD", root.prior = c(1, 0, 0, 0))
+fit
+# Extract ancestral states
+anc_states <- ancr(fit)
+states_nodes <- apply(anc_states$ace, 1, function(x) colnames(anc_states$ace)[which.max(x)])
+
+# Ensure root state is set explicitly to "0.0"
+root_node <- length(tree$tip.label) + 1
+states_nodes[as.character(root_node)] <- "0.0"
+
+# Combine all states (tips + nodes)
+all_states <- c(as.character(states_vec), states_nodes)
+names(all_states) <- c(tree$tip.label, as.character((length(tree$tip.label)+1):(length(tree$tip.label)+tree$Nnode)))
+
+# Identify transitions
+edge <- tree$edge
+parent_states <- all_states[as.character(edge[, 1])]
+child_states  <- all_states[as.character(edge[, 2])]
+transition_edges <- which(parent_states != child_states)
+transition_nodes <- edge[transition_edges, 2]
+internal_transition_nodes <- transition_nodes[transition_nodes > length(tree$tip.label)]
+
+# Annotation data (check column names carefully)
+annotation_df <- df %>%
+  filter(species_name %in% tree$tip.label) %>%
+  select(species_name, tip_state = !!trait_name, order)
+
+annotation_df$tip_state <- factor(annotation_df$tip_state, levels = possible_states)
+
+# MRCA nodes for orders
+order_nodes <- annotation_df %>%
+  group_by(order) %>%
+  filter(n() >= 2) %>%
+  summarise(node = getMRCA(tree, species_name), .groups = "drop") %>%
+  filter(!is.na(node))
+
+# --- PLOT ---
+tree$edge.length <- NULL
+
+# Map states to nodes explicitly
+node_states_df <- tibble(
+  node = 1:(length(tree$tip.label) + tree$Nnode),
+  state = all_states[as.character(c(tree$tip.label, (length(tree$tip.label)+1):(length(tree$tip.label)+tree$Nnode)))]
+)
+
+# Generate plot
+p <- ggtree(tree, layout = "fan",  open.angle=5) %<+% node_states_df +
+  geom_tree(aes(color = state), size = 0.7) +
+  scale_color_manual(values = state_colors, na.value = "gray80") +
+  
+  # Add node points for transitions
+  geom_nodepoint(aes(subset = (node %in% internal_transition_nodes)),
+                 shape = 21, size = 3, stroke = 0.5,
+                 fill = state_colors[states_nodes[as.character(internal_transition_nodes)]]) +
+  
+  # Add clade labels for orders (uncomment to activate)
+   geom_cladelab(data = order_nodes,
+                 mapping = aes(node = node, label = order),
+                fontsize = 4, offset = 0.5, angle = "auto", hjust = 0) +
+  
+  theme(legend.position = "right") +
+  labs(title = paste("Transitions and Tip States:", trait_name))
+
+# Display plot
+print(p)
+
+# --- End of script ---
