@@ -17,4 +17,4 @@ The resulting time-calibrated phylogeny was used for the main analyses. Addition
 
 The time-calibrated tree and updated uncalibrated tree (including Allodapini) were added to this repository in October 2026. These are the original trees used in preparing the published analyses, rather than newly generated phylogenies.
 
-The `archive/` folder contains an earlier version of the uncalibrated tree, before Allodapini was added during peer review.
+The `archive/` folder contains an earlier version of the uncalibrated phylogeny, prior to the addition of Allodapini and divergence-time calibration during peer review.
